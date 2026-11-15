@@ -29,4 +29,8 @@ jobs:
 
       - name: read-version
         id: version
+          APP_VERSION=$(node -p "require('./package.json').version")
+          echo "app version: $APP_VERSION"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+      - name: use version  
         run: echo "app_version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
