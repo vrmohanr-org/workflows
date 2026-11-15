@@ -15,4 +15,5 @@ jobs:
     runs-on: ubuntu-latest
     steps: 
     - name: read version
-      run: echo "Reading version"
+      run: |
+        echo project "${{ inputs.project}}"
