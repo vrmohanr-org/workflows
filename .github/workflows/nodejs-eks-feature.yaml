@@ -8,7 +8,7 @@ name: nodejs-eks-ci
 # caller in the same org, or list them explicitly):
 #   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  - ECR push (same shape as Jenkins' aws-creds)
 #   GH_PAT           - push to catalogue-config, read dependabot alerts, trigger
-#                       catalogue-api-tests; needs repo scope across the vrmohanr repos
+#                       catalogue-api-tests; needs repo scope across the vrmohanr-org repos
 #                       this touches (same single-shared-credential shape as Jenkins'
 #                       github-token — see release-pipeline-spec.md Known Gaps)
 #   ARGOCD_SERVER / ARGOCD_AUTH_TOKEN - poll the ArgoCD Application after the gitops push
@@ -46,7 +46,7 @@ env:
   aws_region: us-east-1
   acc_id: "942701116753"
   registry: 942701116753.dkr.ecr.us-east-1.amazonaws.com
-  org: vrmohanr
+  org: vrmohanr-org
 
 jobs:
   build-test-deploy:
@@ -85,7 +85,7 @@ jobs:
           if-no-files-found: ignore
       - name: status-unit-tests
         if: steps.unit-tests.outcome == 'success' || steps.unit-tests.outcome == 'failure'
-        uses: vrmohanr/workflows/.github/actions/commit-status@main
+        uses: vrmohanr-org/workflows/.github/actions/commit-status@main
         with:
           state: ${{ steps.unit-tests.outcome }}
           context: unit-tests
@@ -133,7 +133,7 @@ jobs:
       #     fi
       - name: status-library-scan
         if: steps.library-scan.outcome == 'success' || steps.library-scan.outcome == 'failure'
-        uses: vrmohanr/workflows/.github/actions/commit-status@main
+        uses: vrmohanr-org/workflows/.github/actions/commit-status@main
         with:
           state: ${{ steps.library-scan.outcome }}
           context: library-scan
@@ -157,7 +157,7 @@ jobs:
           docker build -t ${registry}/${project}/${component}:${{ steps.version.outputs.app_version }} .
       - name: status-build-image
         if: steps.build-image.outcome == 'success' || steps.build-image.outcome == 'failure'
-        uses: vrmohanr/workflows/.github/actions/commit-status@main
+        uses: vrmohanr-org/workflows/.github/actions/commit-status@main
         with:
           state: ${{ steps.build-image.outcome }}
           context: build-image
@@ -197,7 +197,7 @@ jobs:
           if-no-files-found: ignore
       - name: status-trivy-scan
         if: steps.trivy-scan-image.outcome == 'success' || steps.trivy-scan-image.outcome == 'failure'
-        uses: vrmohanr/workflows/.github/actions/commit-status@main
+        uses: vrmohanr-org/workflows/.github/actions/commit-status@main
         with:
           state: ${{ (steps.trivy-scan-image.outcome == 'success' && steps.trivy-scan-dockerfile.outcome == 'success') && 'success' || 'failure' }}
           context: trivy-scan
@@ -210,7 +210,7 @@ jobs:
           docker push ${registry}/${project}/${component}:${{ steps.version.outputs.app_version }}
       - name: status-push-image
         if: steps.push-image.outcome == 'success' || steps.push-image.outcome == 'failure'
-        uses: vrmohanr/workflows/.github/actions/commit-status@main
+        uses: vrmohanr-org/workflows/.github/actions/commit-status@main
         with:
           state: ${{ steps.push-image.outcome }}
           context: push-image
@@ -245,7 +245,7 @@ jobs:
           echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: status-update-config
         if: steps.gitops-update.outcome == 'success' || steps.gitops-update.outcome == 'failure'
-        uses: vrmohanr/workflows/.github/actions/commit-status@main
+        uses: vrmohanr-org/workflows/.github/actions/commit-status@main
         with:
           state: ${{ steps.gitops-update.outcome }}
           context: update-config
@@ -270,7 +270,7 @@ jobs:
           argocd app wait ${{ inputs.argocd-app }} --health --timeout 300 --insecure
       - name: status-dev-deploy
         if: steps.sync-and-wait-argocd.outcome == 'success' || steps.sync-and-wait-argocd.outcome == 'failure'
-        uses: vrmohanr/workflows/.github/actions/commit-status@main
+        uses: vrmohanr-org/workflows/.github/actions/commit-status@main
         with:
           state: ${{ steps.sync-and-wait-argocd.outcome }}
           context: dev-deploy
@@ -336,7 +336,7 @@ jobs:
           gh run watch "$run_id" --repo ${org}/catalogue-api-tests --exit-status
       - name: status-api-tests
         if: steps.api-tests.outcome == 'success' || steps.api-tests.outcome == 'failure'
-        uses: vrmohanr/workflows/.github/actions/commit-status@main
+        uses: vrmohanr-org/workflows/.github/actions/commit-status@main
         with:
           state: ${{ steps.api-tests.outcome }}
           context: api-tests
