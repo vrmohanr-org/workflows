@@ -1,0 +1,28 @@
+# .github/actions/gm/action.yaml
+name: 'Good Morning Composite Action'
+description: 'Greets a user and prints a message using a composite action.'
+
+# Define inputs that the action accepts
+inputs:
+  person:
+    description: 'Who to greet'
+    required: true
+    default: 'World'
+
+# Define outputs if you want to pass data back to the workflow
+outputs:
+  greeting-status:
+    description: 'The status of the greeting'
+    value: ${{ steps.set-status.outputs.status }}
+
+runs:
+  using: 'composite' # Tells GitHub this is a composite action
+  steps:
+    - name: Print Greeting
+      run: echo "Good Morning, ${{ inputs.person }}!"
+      shell: bash # Explicit shell required for composite actions
+
+    - name: Set Output Status
+      id: set-status
+      run: echo "status=success" >> $GITHUB_OUTPUT
+      shell: bash
