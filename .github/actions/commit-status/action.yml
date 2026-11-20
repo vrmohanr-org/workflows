@@ -1,0 +1,28 @@
+name: commit-status
+description: Posts a GitHub commit status for a stage
+inputs:
+  state:
+    description: 'success or failure'
+    required: true
+  context:
+    required: true
+  description:
+    required: true
+  token:
+    required: true
+  sha:
+    description: 'Commit SHA to post the status against (defaults to github.sha)'
+    required: false
+    default: ${{ github.sha }}
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        gh api --method POST repos/${{ github.repository }}/statuses/${{ inputs.sha }} \
+          -f state="${{ inputs.state }}" \
+          -f context="${{ inputs.context }}" \
+          -f description="${{ inputs.description }}" \
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

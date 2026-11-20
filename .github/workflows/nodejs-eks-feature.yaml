@@ -1,4 +1,17 @@
 name: nodejs-eks-ci
+# Reusable workflow, called by a component repo's own workflow file — the
+# GitHub Actions equivalent of nodejsEKSPipeline.groovy in jenkins-shared-library.
+# One parameterized definition instead of copy-pasting build/test/deploy steps
+# into every nodejs service's own workflow.
+#
+# Secrets this workflow needs from the caller (pass `secrets: inherit` from a
+# caller in the same org, or list them explicitly):
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  - ECR push (same shape as Jenkins' aws-creds)
+#   GH_PAT           - push to catalogue-config, read dependabot alerts, trigger
+#                       catalogue-api-tests; needs repo scope across the daws-90s repos
+#                       this touches (same single-shared-credential shape as Jenkins'
+#                       github-token — see release-pipeline-spec.md Known Gaps)
+#   ARGOCD_SERVER / ARGOCD_AUTH_TOKEN - poll the ArgoCD Application after the gitops push
 on:
   workflow_call:
     inputs:
@@ -10,34 +23,341 @@ on:
         description: 'Component name'
         required: true
         type: string
+      argocd-app:
+        description: 'ArgoCD Application name to sync and wait on after the dev-deploy push'
+        required: false
+        type: string
+        default: 'catalogue'
+    secrets:
+      # AWS_ACCESS_KEY_ID:
+      #   required: true
+      # AWS_SECRET_ACCESS_KEY:
+      #   required: true
+      GH_PAT:
+        required: true
+      ARGOCD_SERVER:
+        required: true
+      ARGOCD_AUTH_TOKEN:
+        required: true
 
 env:
   project: ${{ inputs.project }}
   component: ${{ inputs.component }}
+  aws_region: us-east-1
+  acc_id: "942701116753"
+  registry: 942701116753.dkr.ecr.us-east-1.amazonaws.com
+  org: vrmohanr
 
 jobs:
-  build-nodejs:
-    # runs-on: ubuntu-latest
+  build-test-deploy:
     runs-on:
       group: roboshop
       labels: nodejs-dev
+    permissions:
+      statuses: write
+    # contents: write
+    # pull-requests: write
     steps:
       - name: checkout code
         uses: actions/checkout@v4
 
-      - name: list files
-        run: |
-          ls -l
-          echo "project=$project component=$component"
-
+      # mirrors 'read-version' stage — appVersion tags dev images/deploys,
+      # same as packageJson.version did in the Jenkinsfile
       - name: read-version
         id: version
-        run: |
-          APP_VERSION=$(node -p "require('./package.json').version")
-          echo "app version: $APP_VERSION"
-          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-      - name: use version  
         run: echo "app_version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
+      - name: install-dependencies
+        run: npm install
+
+      # jest-junit is already configured in package.json; upload the report the
+      # same way Jenkins' junit step archived it, so failures are inspectable
+      # from the run summary without re-running locally
       - name: unit-tests
+        id: unit-tests
         run: npm test
+      - name: upload unit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: junit.xml
+          if-no-files-found: ignore
+      - name: status-unit-tests
+        if: steps.unit-tests.outcome == 'success' || steps.unit-tests.outcome == 'failure'
+        uses: daws-90s/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.unit-tests.outcome }}
+          context: unit-tests
+          description: ${{ steps.unit-tests.outcome == 'success' && 'Unit tests passed' || 'Unit tests failed' }}
+          token: ${{ github.token }}
+
+      # mirrors 'library-scan' stage — fail on open high/critical dependabot alerts
+      # - name: library-scan
+      #   id: library-scan
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GH_PAT }}
+      #   run: |
+      #     set -e
+      #     REPO="${org}/${component}"
+
+      #     HTTP_CODE=$(curl -s -L -w "%{http_code}" \
+      #     -H "Accept: application/vnd.github+json" \
+      #     -H "Authorization: Bearer ${GH_TOKEN}" \
+      #     -H "X-GitHub-Api-Version: 2022-11-28" \
+      #     "https://api.github.com/repos/${REPO}/dependabot/alerts?state=open" \
+      #     -o alerts.json)
+
+      #     if [ "$HTTP_CODE" -ge 400 ]; then
+      #       echo "GitHub API request failed with HTTP ${HTTP_CODE}"
+      #       cat alerts.json
+      #       exit 1
+      #     fi
+
+      #     # Confirm the response is actually a JSON array, not an error object
+      #     if ! jq -e 'type == "array"' alerts.json > /dev/null 2>&1; then
+      #       echo "Unexpected API response (not an array):"
+      #       cat alerts.json
+      #       exit 1
+      #     fi
+
+      #     echo "---- Open Dependabot Alerts ----"
+      #     jq -r '.[] | "\(.number)\t\(.security_vulnerability.severity)\t\(.dependency.package.name)\t\(.security_advisory.ghsa_id)"' alerts.json
+
+      #     HIGH_CRITICAL_COUNT=$(jq '[.[] | select(.security_vulnerability.severity == "high" or .security_vulnerability.severity == "critical")] | length' alerts.json)
+      #     echo "High/Critical alert count: ${HIGH_CRITICAL_COUNT}"
+
+      #     if [ "$HIGH_CRITICAL_COUNT" -gt 0 ]; then
+      #       echo "Found ${HIGH_CRITICAL_COUNT} High/Critical severity dependency alert(s). Failing build."
+      #       exit 1
+      #     fi
+      - name: status-library-scan
+        if: steps.library-scan.outcome == 'success' || steps.library-scan.outcome == 'failure'
+        uses: daws-90s/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.library-scan.outcome }}
+          context: library-scan
+          description: ${{ steps.library-scan.outcome == 'success' && 'Library scan passed' || 'Library scan failed' }}
+          token: ${{ github.token }}
+
+      # - name: configure aws credentials
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ env.aws_region }}
+
+      - name: ecr login
+        run: |
+          aws ecr get-login-password --region ${aws_region} | docker login --username AWS --password-stdin ${registry}
+
+      - name: build-image
+        id: build-image
+        run: |
+          docker build -t ${registry}/${project}/${component}:${{ steps.version.outputs.app_version }} .
+      - name: status-build-image
+        if: steps.build-image.outcome == 'success' || steps.build-image.outcome == 'failure'
+        uses: daws-90s/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.build-image.outcome }}
+          context: build-image
+          description: ${{ steps.build-image.outcome == 'success' && 'Docker image build' || 'Docker image build failed' }}
+          token: ${{ github.token }}
+
+      # # mirrors 'trivy-scan' stage — same two checks: image vuln scan, Dockerfile config scan
+      - name: trivy-scan image
+        id: trivy-scan-image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
+          vuln-type: os
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          format: table
+          output: trivy-image-report.txt
+
+      - name: trivy-scan dockerfile
+        id: trivy-scan-dockerfile
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: Dockerfile
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          format: table
+          output: trivy-dockerfile-report.txt
+
+      - name: upload trivy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports
+          path: trivy-*.txt
+          if-no-files-found: ignore
+      - name: status-trivy-scan
+        if: steps.trivy-scan-image.outcome == 'success' || steps.trivy-scan-image.outcome == 'failure'
+        uses: daws-90s/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ (steps.trivy-scan-image.outcome == 'success' && steps.trivy-scan-dockerfile.outcome == 'success') && 'success' || 'failure' }}
+          context: trivy-scan
+          description: ${{ (steps.trivy-scan-image.outcome == 'success' && steps.trivy-scan-dockerfile.outcome == 'success') && 'trivy scan success' || 'trivy scan failed' }}
+          token: ${{ github.token }}
+
+      - name: push-image-to-ecr
+        id: push-image
+        run: |
+          docker push ${registry}/${project}/${component}:${{ steps.version.outputs.app_version }}
+      - name: status-push-image
+        if: steps.push-image.outcome == 'success' || steps.push-image.outcome == 'failure'
+        uses: daws-90s/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.push-image.outcome }}
+          context: push-image
+          description: ${{ steps.push-image.outcome == 'success' && 'push image to ECR' || 'push image to ECR failed' }}
+          token: ${{ github.token }}
+
+      # mirrors 'dev-deploy' stage, but GitOps-style: no direct helm/kubectl from
+      # CI. Commit the new image straight to catalogue-config main (dev has no
+      # approval gate, so no PR-and-merge cycle needed here — see
+      # argocd-gitops-spec.md's non-goals) and let the already-automated
+      # catalogue ArgoCD Application pick it up. imageName is constant
+      # (already seeded in catalogue-config) — only imageVersion changes per
+      # deploy, so that's the only key touched here.
+      - name: checkout catalogue-config
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.org }}/catalogue-config
+          token: ${{ secrets.GH_PAT }}
+          path: catalogue-config
+
+      - name: update-config-repo
+        id: gitops-update
+        working-directory: catalogue-config
+        run: |
+          set -e
+          yq -i ".deployment.imageVersion = \"${{ steps.version.outputs.app_version }}\"" values-dev.yaml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "Deploy ${component}@${{ steps.version.outputs.app_version }} to dev (${{ github.sha }})"
+          git push origin main
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: status-update-config
+        if: steps.gitops-update.outcome == 'success' || steps.gitops-update.outcome == 'failure'
+        uses: daws-90s/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.gitops-update.outcome }}
+          context: update-config
+          description: ${{ steps.gitops-update.outcome == 'success' && 'catalogue-config updated' || 'Failed to update catalogue-config' }}
+          token: ${{ github.token }}
+
+      # mirrors 'kubectl rollout status' — force a sync of the commit that was
+      # just pushed (don't wait on the 45s auto-sync poll) and fail the
+      # workflow if it isn't Healthy within 5 minutes
+      - name: sync-and-wait-argocd
+        id: sync-and-wait-argocd
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          set -e
+          curl -sSLk -o argocd https://${ARGOCD_SERVER}/download/argocd-linux-amd64
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/argocd
+
+          argocd app sync ${{ inputs.argocd-app }} --insecure
+          argocd app wait ${{ inputs.argocd-app }} --health --timeout 300 --insecure
+      - name: status-dev-deploy
+        if: steps.sync-and-wait-argocd.outcome == 'success' || steps.sync-and-wait-argocd.outcome == 'failure'
+        uses: daws-90s/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.sync-and-wait-argocd.outcome }}
+          context: dev-deploy
+          description: ${{ steps.sync-and-wait-argocd.outcome == 'success' && 'Deployed to roboshop-dev' || 'Deploy to roboshop-dev failed' }}
+          token: ${{ github.token }}
+
+      # mirrors Jenkins' utils.getPodIP() — need the real pod IP (routable in
+      # the VPC via the AWS VPC CNI), not the ClusterIP/Service DNS, since
+      # this runner isn't guaranteed to be a cluster pod with CoreDNS as its
+      # resolver. Resolved via the ArgoCD API (resource-tree + resource
+      # endpoints) instead of kubectl, so the runner doesn't need its own
+      # cluster credentials.
+      - name: get-catalogue-endpoint
+        id: endpoint
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          set -e
+          read -r namespace name <<< "$(curl -sSLk -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
+            "https://${ARGOCD_SERVER}/api/v1/applications/${{ inputs.argocd-app }}/resource-tree" \
+            | jq -r '[.nodes[] | select(.kind == "Pod" and .health.status == "Healthy")][0] | "\(.namespace) \(.name)"')"
+
+          if [ -z "$name" ] || [ "$name" == "null" ]; then
+            echo "No healthy catalogue pod found in ArgoCD app ${{ inputs.argocd-app }}"
+            exit 1
+          fi
+
+          pod_ip=$(curl -sSLk -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
+            --get "https://${ARGOCD_SERVER}/api/v1/applications/${{ inputs.argocd-app }}/resource" \
+            --data-urlencode "namespace=${namespace}" \
+            --data-urlencode "resourceName=${name}" \
+            --data-urlencode "version=v1" \
+            --data-urlencode "kind=Pod" \
+            | jq -r '.manifest | fromjson | .status.podIP')
+
+          if [ -z "$pod_ip" ] || [ "$pod_ip" == "null" ]; then
+            echo "Could not resolve pod IP for ${name}"
+            exit 1
+          fi
+
+          echo "catalogue_url=http://${pod_ip}:8080" >> "$GITHUB_OUTPUT"
+
+      # mirrors 'api-tests' stage — same cross-job hand-off as Jenkins'
+      # `build job: 'ROBOSHOP/catalogue-api-tests'`, just via a workflow_dispatch
+      # in that repo (owned by SDET) instead of a Jenkins job
+      - name: trigger catalogue-api-tests
+        id: api-tests
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -e
+          gh workflow run api-tests.yaml \
+            --repo ${org}/catalogue-api-tests \
+            --ref main \
+            -f namespace=roboshop-dev \
+            -f commit_id=${{ github.sha }} \
+            -f catalogue_url=${{ steps.endpoint.outputs.catalogue_url }}
+
+          sleep 10
+          run_id=$(gh run list --repo ${org}/catalogue-api-tests --workflow=api-tests.yaml --json databaseId,createdAt --jq 'sort_by(.createdAt) | last | .databaseId')
+          echo "watching catalogue-api-tests run $run_id"
+          gh run watch "$run_id" --repo ${org}/catalogue-api-tests --exit-status
+      - name: status-api-tests
+        if: steps.api-tests.outcome == 'success' || steps.api-tests.outcome == 'failure'
+        uses: daws-90s/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.api-tests.outcome }}
+          context: api-tests
+          description: ${{ steps.api-tests.outcome == 'success' && 'catalogue-api-tests passed' || 'catalogue-api-tests failed' }}
+          token: ${{ github.token }}
+
+      # # mirrors 'raise-pr' stage — same create-or-find semantics as
+      # # utils.createPullRequest(), scoped to this repo so the default token is enough
+      - name: raise-pr
+        if: github.ref_name != 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          existing=$(gh pr list --head "${{ github.ref_name }}" --base main --state open --json number --jq 'length')
+          if [ "$existing" -gt 0 ]; then
+            echo "PR already open for ${{ github.ref_name }} -> main"
+          else
+            body=$(printf 'Automated PR after successful dev-deploy and api-tests.\n\nRun: %s/%s/actions/runs/%s' \
+              "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
+            gh pr create --base main --head "${{ github.ref_name }}" \
+              --title "${component}: ${{ github.ref_name }} -> main" \
+              --body "$body"
+          fi
